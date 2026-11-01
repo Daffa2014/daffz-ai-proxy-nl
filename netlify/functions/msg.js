@@ -1,9 +1,19 @@
-// DaffzHub Message proxy v3 (Netlify function). Supabase URL and service key live ONLY in
+// DaffzHub Message proxy v4 (Netlify function). Supabase URL and service key live ONLY in
 // Netlify environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY), never in this file or in GitHub.
+// Staff badges: OWNER_KEY (one secret) and ADMIN_KEYS (secrets separated by commas) are also Netlify environment variables.
 // Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private)
 const hitsSend = new Map(); // best-effort limits per IP (reset when the function restarts)
 const hitsGet = new Map();
 const hitsPres = new Map();
+const hitsTr = new Map();
+
+// who is this key? Only the server knows the secrets. Wrong or missing key = no badge.
+function roleOf(k) {
+  if (typeof k !== "string" || k.length < 8 || k.length > 100) return null;
+  if (process.env.OWNER_KEY && k === process.env.OWNER_KEY) return "owner";
+  const list = String(process.env.ADMIN_KEYS || "").split(",").map((x) => x.trim()).filter((x) => x.length >= 8);
+  return list.indexOf(k) >= 0 ? "admin" : null;
+}
 
 function count(map, ip, windowMs) {
   const now = Date.now();
@@ -44,7 +54,7 @@ exports.handler = async (event) => {
 
   // read the newest messages of one room (after = last id the client already has)
   async function readRoom(room, after) {
-    let q = url + "?select=id,name,body,uid,created_at&room=eq." + encodeURIComponent(room);
+    let q = url + "?select=id,name,body,uid,role,created_at&room=eq." + encodeURIComponent(room);
     if (after === null) q += "&order=id.desc&limit=30";
     else q += "&id=gt." + after + "&order=id.asc&limit=50";
     const r = await fetch(q, { headers: sb });
@@ -67,7 +77,7 @@ exports.handler = async (event) => {
       const body = clean(b.body, 200);
       if (!name || !body) return send(400, { error: "Empty message" });
       const uid = Number.isInteger(b.uid) && b.uid > 0 ? b.uid : null;
-      const r = await fetch(url, { method: "POST", headers: Object.assign({ Prefer: "return=minimal" }, sb), body: JSON.stringify({ room, name, body, uid }) });
+      const r = await fetch(url, { method: "POST", headers: Object.assign({ Prefer: "return=minimal" }, sb), body: JSON.stringify({ room, name, body, uid, role: roleOf(b.key) }) });
       if (!r.ok) return send(502, { error: "Could not save" });
       // now and then delete messages older than 1 day so the table stays small
       if (Math.random() < 0.05) {
@@ -104,17 +114,44 @@ exports.handler = async (event) => {
       const up = await fetch(purl + "?on_conflict=room,uid", {
         method: "POST",
         headers: Object.assign({}, sb, { Prefer: "resolution=merge-duplicates,return=minimal" }),
-        body: JSON.stringify({ room: b.room, uid, name, seen_at: new Date().toISOString() }),
+        body: JSON.stringify({ room: b.room, uid, name, role: roleOf(b.key), seen_at: new Date().toISOString() }),
       });
       if (!up.ok) return send(502, { error: "Could not save" });
       const since = new Date(Date.now() - 45000).toISOString();
-      const r = await fetch(purl + "?select=uid,name&limit=100&room=eq." + encodeURIComponent(b.room) + "&seen_at=gte." + encodeURIComponent(since), { headers: sb });
+      const r = await fetch(purl + "?select=uid,name,role&limit=100&room=eq." + encodeURIComponent(b.room) + "&seen_at=gte." + encodeURIComponent(since), { headers: sb });
       if (!r.ok) return send(502, { error: "Could not read" });
       if (Math.random() < 0.05) {
         const old = new Date(Date.now() - 600000).toISOString();
         fetch(purl + "?seen_at=lt." + encodeURIComponent(old), { method: "DELETE", headers: sb }).catch(() => {});
       }
       return send(200, { users: await r.json() });
+    }
+
+    // translate: one short text -> target language (free public translate service, no key needed)
+    if (b.action === "translate") {
+      if (count(hitsTr, ip, 60000) > 40) return send(429, { error: "Too many requests" });
+      const text = clean(b.text, 300);
+      const to = typeof b.to === "string" ? b.to : "";
+      if (!text || !/^[a-zA-Z]{2,3}(-[a-zA-Z]{2,4})?$/.test(to)) return send(400, { error: "Bad text or language" });
+      try {
+        const r = await fetch("https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=auto&tl=" + encodeURIComponent(to) + "&q=" + encodeURIComponent(text));
+        if (r.ok) {
+          const d = await r.json();
+          if (Array.isArray(d) && Array.isArray(d[0])) {
+            const out = d[0].map((p) => (Array.isArray(p) && typeof p[0] === "string" ? p[0] : "")).join("").slice(0, 600);
+            if (out) return send(200, { text: out, src: typeof d[2] === "string" ? d[2] : "" });
+          }
+        }
+      } catch (e) { /* try the backup below */ }
+      try {
+        const r2 = await fetch("https://api.mymemory.translated.net/get?q=" + encodeURIComponent(text) + "&langpair=" + encodeURIComponent("Autodetect|" + to));
+        if (r2.ok) {
+          const d2 = await r2.json();
+          const t = d2 && d2.responseData && d2.responseData.translatedText;
+          if (typeof t === "string" && t) return send(200, { text: t.slice(0, 600), src: "" });
+        }
+      } catch (e) { /* give up */ }
+      return send(502, { error: "Translate service unavailable" });
     }
 
     return send(400, { error: "Bad action" });
