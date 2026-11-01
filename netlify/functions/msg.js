@@ -1,4 +1,4 @@
-// DaffzHub Message proxy v5 (Netlify function). Supabase URL and service key live ONLY in
+// DaffzHub Message proxy v6 (Netlify function). Supabase URL and service key live ONLY in
 // Netlify environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY), never in this file or in GitHub.
 // Staff badges: OWNER_KEY (one secret) and ADMIN_KEYS (secrets separated by commas) are also Netlify environment variables.
 // Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private)
@@ -6,6 +6,8 @@ const hitsSend = new Map(); // best-effort limits per IP (reset when the functio
 const hitsGet = new Map();
 const hitsPres = new Map();
 const hitsTr = new Map();
+const hitsStats = new Map();
+let statsCache = { t: 0, data: null };
 
 // who is this key? Only the server knows the secrets. Wrong or missing key = no badge.
 function roleOf(k) {
@@ -51,6 +53,7 @@ exports.handler = async (event) => {
   const sb = { apikey: key, Authorization: "Bearer " + key, "Content-Type": "application/json" };
   const url = base.replace(/\/+$/, "") + "/rest/v1/dh_messages";
   const purl = base.replace(/\/+$/, "") + "/rest/v1/dh_presence";
+  const uurl = base.replace(/\/+$/, "") + "/rest/v1/dh_users";
 
   // read the newest messages of one room (after = last id the client already has)
   async function readRoom(room, after) {
@@ -166,6 +169,33 @@ exports.handler = async (event) => {
         }
       } catch (e) { /* give up */ }
       return send(502, { error: "Translate service unavailable" });
+    }
+
+    // stats: anonymous hub counter. The hub sends a random id (no Roblox id, no name). Returns how many hubs are alive.
+    if (b.action === "stats") {
+      if (count(hitsStats, ip, 60000) > 6) return send(429, { error: "Too many requests" });
+      if (typeof b.id !== "string" || !/^[A-Za-z0-9]{16,40}$/.test(b.id)) return send(400, { error: "Bad id" });
+      const now = Date.now();
+      const up = await fetch(uurl + "?on_conflict=id", {
+        method: "POST",
+        headers: Object.assign({}, sb, { Prefer: "resolution=merge-duplicates,return=minimal" }),
+        body: JSON.stringify({ id: b.id, last_seen: new Date(now).toISOString() }),
+      });
+      if (!up.ok) return send(502, { error: "Could not save" });
+      if (statsCache.data && now - statsCache.t < 20000) return send(200, statsCache.data);
+      const countSince = async (ms) => {
+        const q = ms > 0 ? "&last_seen=gte." + encodeURIComponent(new Date(now - ms).toISOString()) : "";
+        const r = await fetch(uurl + "?select=id" + q, { method: "HEAD", headers: Object.assign({}, sb, { Prefer: "count=exact" }) });
+        const n = parseInt(String(r.headers.get("content-range") || "").split("/")[1], 10);
+        return Number.isFinite(n) ? n : 0;
+      };
+      const [online, day, week, month, total] = await Promise.all([countSince(120000), countSince(86400000), countSince(7 * 86400000), countSince(30 * 86400000), countSince(0)]);
+      statsCache = { t: now, data: { online, day, week, month, total } };
+      if (Math.random() < 0.02) {
+        const old = new Date(now - 90 * 86400000).toISOString();
+        fetch(uurl + "?last_seen=lt." + encodeURIComponent(old), { method: "DELETE", headers: sb }).catch(() => {});
+      }
+      return send(200, statsCache.data);
     }
 
     return send(400, { error: "Bad action" });
