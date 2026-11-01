@@ -1,4 +1,4 @@
-// DaffzHub Message proxy v4 (Netlify function). Supabase URL and service key live ONLY in
+// DaffzHub Message proxy v5 (Netlify function). Supabase URL and service key live ONLY in
 // Netlify environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY), never in this file or in GitHub.
 // Staff badges: OWNER_KEY (one secret) and ADMIN_KEYS (secrets separated by commas) are also Netlify environment variables.
 // Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private)
@@ -124,7 +124,21 @@ exports.handler = async (event) => {
         const old = new Date(Date.now() - 600000).toISOString();
         fetch(purl + "?seen_at=lt." + encodeURIComponent(old), { method: "DELETE", headers: sb }).catch(() => {});
       }
-      return send(200, { users: await r.json() });
+      const users = await r.json();
+      // everyone online in DaffzHub (all servers) - only for clients that ask with all:true (they are online and visible too)
+      if (b.all === true) {
+        const ra = await fetch(purl + "?select=uid,name,role&order=seen_at.desc&limit=80&seen_at=gte." + encodeURIComponent(since), { headers: sb });
+        if (ra.ok) {
+          const rows = await ra.json();
+          const seen = new Set();
+          const all = [];
+          for (const u of rows) {
+            if (u && typeof u.uid === "number" && !seen.has(u.uid)) { seen.add(u.uid); all.push({ uid: u.uid, name: u.name, role: u.role || null }); }
+          }
+          return send(200, { users, all: all.slice(0, 50), online: all.length });
+        }
+      }
+      return send(200, { users });
     }
 
     // translate: one short text -> target language (free public translate service, no key needed)
