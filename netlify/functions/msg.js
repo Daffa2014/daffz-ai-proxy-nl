@@ -1,8 +1,9 @@
-// DaffzHub Message proxy v2 (Netlify function). Supabase URL and service key live ONLY in
+// DaffzHub Message proxy v3 (Netlify function). Supabase URL and service key live ONLY in
 // Netlify environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY), never in this file or in GitHub.
 // Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private)
 const hitsSend = new Map(); // best-effort limits per IP (reset when the function restarts)
 const hitsGet = new Map();
+const hitsPres = new Map();
 
 function count(map, ip, windowMs) {
   const now = Date.now();
@@ -39,6 +40,7 @@ exports.handler = async (event) => {
 
   const sb = { apikey: key, Authorization: "Bearer " + key, "Content-Type": "application/json" };
   const url = base.replace(/\/+$/, "") + "/rest/v1/dh_messages";
+  const purl = base.replace(/\/+$/, "") + "/rest/v1/dh_presence";
 
   // read the newest messages of one room (after = last id the client already has)
   async function readRoom(room, after) {
@@ -90,6 +92,29 @@ exports.handler = async (event) => {
       const out = {};
       for (const [n, rows] of await Promise.all(jobs)) out[n] = rows;
       return send(200, { rooms: out });
+    }
+
+    // presence: "I am here" + who else is here (only DaffzHub users that also ask are told)
+    if (b.action === "presence") {
+      if (count(hitsPres, ip, 60000) > 8) return send(429, { error: "Too many requests" });
+      if (typeof b.room !== "string" || !/^s:[A-Za-z0-9_\-]{1,70}$/.test(b.room)) return send(400, { error: "Bad room" });
+      const uid = Number.isInteger(b.uid) && b.uid > 0 ? b.uid : null;
+      const name = clean(b.name, 30);
+      if (!uid || !name) return send(400, { error: "Bad user" });
+      const up = await fetch(purl + "?on_conflict=room,uid", {
+        method: "POST",
+        headers: Object.assign({}, sb, { Prefer: "resolution=merge-duplicates,return=minimal" }),
+        body: JSON.stringify({ room: b.room, uid, name, seen_at: new Date().toISOString() }),
+      });
+      if (!up.ok) return send(502, { error: "Could not save" });
+      const since = new Date(Date.now() - 45000).toISOString();
+      const r = await fetch(purl + "?select=uid,name&limit=100&room=eq." + encodeURIComponent(b.room) + "&seen_at=gte." + encodeURIComponent(since), { headers: sb });
+      if (!r.ok) return send(502, { error: "Could not read" });
+      if (Math.random() < 0.05) {
+        const old = new Date(Date.now() - 600000).toISOString();
+        fetch(purl + "?seen_at=lt." + encodeURIComponent(old), { method: "DELETE", headers: sb }).catch(() => {});
+      }
+      return send(200, { users: await r.json() });
     }
 
     return send(400, { error: "Bad action" });
