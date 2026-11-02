@@ -1,12 +1,15 @@
-// DaffzHub Message proxy v6 (Netlify function). Supabase URL and service key live ONLY in
+// DaffzHub Message proxy v7 (Netlify function). Supabase URL and service key live ONLY in
 // Netlify environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY), never in this file or in GitHub.
 // Staff badges: OWNER_KEY (one secret) and ADMIN_KEYS (secrets separated by commas) are also Netlify environment variables.
-// Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private)
+// Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private), c:<secret code> (group)
+// Groups: max 5 members, max 3 groups per person. Joining gives a signed token (valid 7 days) that the hub sends with every group request.
+const crypto = require("crypto");
 const hitsSend = new Map(); // best-effort limits per IP (reset when the function restarts)
 const hitsGet = new Map();
 const hitsPres = new Map();
 const hitsTr = new Map();
 const hitsStats = new Map();
+const hitsGrp = new Map();
 let statsCache = { t: 0, data: null };
 
 // who is this key? Only the server knows the secrets. Wrong or missing key = no badge.
@@ -15,6 +18,25 @@ function roleOf(k) {
   if (process.env.OWNER_KEY && k === process.env.OWNER_KEY) return "owner";
   const list = String(process.env.ADMIN_KEYS || "").split(",").map((x) => x.trim()).filter((x) => x.length >= 8);
   return list.indexOf(k) >= 0 ? "admin" : null;
+}
+
+// group token = <expiry seconds>.<signature>. The secret is derived from the Supabase service key, so no new setting is needed.
+function tokenSig(room, uid, exp) {
+  return crypto.createHmac("sha256", "dh-group|" + String(process.env.SUPABASE_SERVICE_KEY || "")).update(room + "|" + uid + "|" + exp).digest("hex").slice(0, 32);
+}
+function makeToken(room, uid) {
+  const exp = Math.floor((Date.now() + TOKEN_MS) / 1000);
+  return { token: exp + "." + tokenSig(room, uid, exp), exp };
+}
+function checkToken(room, uid, token) {
+  if (typeof token !== "string" || !Number.isInteger(uid) || uid <= 0) return false;
+  const m = /^(\d{8,12})\.([0-9a-f]{32})$/.exec(token);
+  if (!m) return false;
+  const exp = parseInt(m[1], 10);
+  if (exp * 1000 < Date.now()) return false;
+  const want = Buffer.from(tokenSig(room, uid, exp));
+  const got = Buffer.from(m[2]);
+  return want.length === got.length && crypto.timingSafeEqual(want, got);
 }
 
 function count(map, ip, windowMs) {
@@ -34,7 +56,12 @@ function clean(s, max) {
     .slice(0, max);
 }
 
-const ROOM_RE = /^(g|[smp]:[A-Za-z0-9_\-]{1,70})$/;
+const ROOM_RE = /^(g|[smp]:[A-Za-z0-9_\-]{1,70}|c:[A-Za-z0-9]{10,16})$/;
+const GROUP_RE = /^c:[A-Za-z0-9]{10,16}$/;
+const GROUP_MAX_MEMBERS = 5;
+const GROUP_MAX_PER_USER = 3;
+const GROUP_ACTIVE_MS = 30 * 86400000; // somebody who did not show up for 30 days frees the place
+const TOKEN_MS = 7 * 86400000;
 
 exports.handler = async (event) => {
   const send = (code, obj) => ({ statusCode: code, headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) });
@@ -54,6 +81,7 @@ exports.handler = async (event) => {
   const url = base.replace(/\/+$/, "") + "/rest/v1/dh_messages";
   const purl = base.replace(/\/+$/, "") + "/rest/v1/dh_presence";
   const uurl = base.replace(/\/+$/, "") + "/rest/v1/dh_users";
+  const gurl = base.replace(/\/+$/, "") + "/rest/v1/dh_group_members";
 
   // read the newest messages of one room (after = last id the client already has)
   async function readRoom(room, after) {
@@ -80,6 +108,7 @@ exports.handler = async (event) => {
       const body = clean(b.body, 200);
       if (!name || !body) return send(400, { error: "Empty message" });
       const uid = Number.isInteger(b.uid) && b.uid > 0 ? b.uid : null;
+      if (GROUP_RE.test(room) && !checkToken(room, uid, b.token)) return send(403, { error: "Not a member of this group" });
       const r = await fetch(url, { method: "POST", headers: Object.assign({ Prefer: "return=minimal" }, sb), body: JSON.stringify({ room, name, body, uid, role: roleOf(b.key) }) });
       if (!r.ok) return send(502, { error: "Could not save" });
       // now and then delete messages older than 1 day so the table stays small
@@ -94,17 +123,21 @@ exports.handler = async (event) => {
     if (b.action === "pull") {
       if (count(hitsGet, ip, 60000) > 40) return send(429, { error: "Too many requests" });
       if (!b.rooms || typeof b.rooms !== "object") return send(400, { error: "Bad rooms" });
-      const names = Object.keys(b.rooms).slice(0, 4);
+      const names = Object.keys(b.rooms).slice(0, 8);
       const jobs = [];
+      const denied = [];
+      const puid = Number.isInteger(b.uid) && b.uid > 0 ? b.uid : null;
       for (const n of names) {
         const room = b.rooms[n];
         if (!/^[a-z]{1,10}$/.test(n) || typeof room !== "string" || !ROOM_RE.test(room)) return send(400, { error: "Bad room" });
+        // group rooms: only people with a valid token can read. The others are skipped (the hub renews its token and tries again).
+        if (GROUP_RE.test(room) && !checkToken(room, puid, b.tokens && typeof b.tokens === "object" ? b.tokens[n] : null)) { denied.push(n); continue; }
         const after = b.after && typeof b.after === "object" ? afterOf(b.after[n]) : null;
         jobs.push(readRoom(room, after).then((rows) => [n, rows]));
       }
       const out = {};
       for (const [n, rows] of await Promise.all(jobs)) out[n] = rows;
-      return send(200, { rooms: out });
+      return send(200, { rooms: out, denied });
     }
 
     // presence: "I am here" + who else is here (only DaffzHub users that also ask are told)
@@ -142,6 +175,51 @@ exports.handler = async (event) => {
         }
       }
       return send(200, { users });
+    }
+
+    // groups: join (also used to renew the token), leave, member count
+    if (b.action === "gjoin" || b.action === "gleave" || b.action === "gmembers") {
+      if (count(hitsGrp, ip, 60000) > 20) return send(429, { error: "Too many requests" });
+      if (typeof b.room !== "string" || !GROUP_RE.test(b.room)) return send(400, { error: "Bad group code" });
+      const uid = Number.isInteger(b.uid) && b.uid > 0 ? b.uid : null;
+      if (!uid) return send(400, { error: "Bad user" });
+      const room = b.room;
+      const since = new Date(Date.now() - GROUP_ACTIVE_MS).toISOString();
+      const activeOf = async (q) => {
+        const r = await fetch(gurl + "?select=room,uid&limit=20&last_seen=gte." + encodeURIComponent(since) + "&" + q, { headers: sb });
+        if (!r.ok) throw new Error("members");
+        return r.json();
+      };
+      if (b.action === "gleave") {
+        if (!checkToken(room, uid, b.token)) return send(403, { error: "Not a member of this group" });
+        await fetch(gurl + "?room=eq." + encodeURIComponent(room) + "&uid=eq." + uid, { method: "DELETE", headers: sb });
+        return send(200, { ok: true });
+      }
+      if (b.action === "gmembers") {
+        if (!checkToken(room, uid, b.token)) return send(403, { error: "Not a member of this group" });
+        const list = await activeOf("room=eq." + encodeURIComponent(room));
+        return send(200, { members: list.length, max: GROUP_MAX_MEMBERS });
+      }
+      // gjoin
+      const list = await activeOf("room=eq." + encodeURIComponent(room));
+      const isMember = list.some((m) => m.uid === uid);
+      if (!isMember) {
+        if (list.length >= GROUP_MAX_MEMBERS) return send(409, { error: "This group is full (" + GROUP_MAX_MEMBERS + " members)" });
+        const mine = await activeOf("uid=eq." + uid);
+        if (mine.length >= GROUP_MAX_PER_USER) return send(409, { error: "You are already in " + GROUP_MAX_PER_USER + " groups" });
+      }
+      const up = await fetch(gurl + "?on_conflict=room,uid", {
+        method: "POST",
+        headers: Object.assign({}, sb, { Prefer: "resolution=merge-duplicates,return=minimal" }),
+        body: JSON.stringify({ room, uid, last_seen: new Date().toISOString() }),
+      });
+      if (!up.ok) return send(502, { error: "Could not save" });
+      if (Math.random() < 0.02) {
+        const old = new Date(Date.now() - 45 * 86400000).toISOString();
+        fetch(gurl + "?last_seen=lt." + encodeURIComponent(old), { method: "DELETE", headers: sb }).catch(() => {});
+      }
+      const t = makeToken(room, uid);
+      return send(200, { token: t.token, exp: t.exp, members: isMember ? list.length : list.length + 1, max: GROUP_MAX_MEMBERS });
     }
 
     // translate: one short text -> target language (free public translate service, no key needed)
