@@ -1,4 +1,4 @@
-// DaffzHub Message proxy v7 (Netlify function). Supabase URL and service key live ONLY in
+// DaffzHub Message proxy v8 (Netlify function). Supabase URL and service key live ONLY in
 // Netlify environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY), never in this file or in GitHub.
 // Staff badges: OWNER_KEY (one secret) and ADMIN_KEYS (secrets separated by commas) are also Netlify environment variables.
 // Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private), c:<secret code> (group)
@@ -10,6 +10,7 @@ const hitsPres = new Map();
 const hitsTr = new Map();
 const hitsStats = new Map();
 const hitsGrp = new Map();
+const hitsFb = new Map();
 let statsCache = { t: 0, data: null };
 
 // who is this key? Only the server knows the secrets. Wrong or missing key = no badge.
@@ -82,6 +83,7 @@ exports.handler = async (event) => {
   const purl = base.replace(/\/+$/, "") + "/rest/v1/dh_presence";
   const uurl = base.replace(/\/+$/, "") + "/rest/v1/dh_users";
   const gurl = base.replace(/\/+$/, "") + "/rest/v1/dh_group_members";
+  const furl = base.replace(/\/+$/, "") + "/rest/v1/dh_feedback";
 
   // read the newest messages of one room (after = last id the client already has)
   async function readRoom(room, after) {
@@ -227,26 +229,50 @@ exports.handler = async (event) => {
       if (count(hitsTr, ip, 60000) > 40) return send(429, { error: "Too many requests" });
       const text = clean(b.text, 300);
       const to = typeof b.to === "string" ? b.to : "";
-      if (!text || !/^[a-zA-Z]{2,3}(-[a-zA-Z]{2,4})?$/.test(to)) return send(400, { error: "Bad text or language" });
+      const LANG_RE = /^[a-zA-Z]{2,3}(-[a-zA-Z]{2,4})?$/;
+      if (!text || !LANG_RE.test(to)) return send(400, { error: "Bad text or language" });
+      // optional source language: "auto" (or missing) = detect it
+      const from = typeof b.from === "string" && LANG_RE.test(b.from) ? b.from : "auto";
       try {
-        const r = await fetch("https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=auto&tl=" + encodeURIComponent(to) + "&q=" + encodeURIComponent(text));
+        const r = await fetch("https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=" + encodeURIComponent(from) + "&tl=" + encodeURIComponent(to) + "&q=" + encodeURIComponent(text));
         if (r.ok) {
           const d = await r.json();
           if (Array.isArray(d) && Array.isArray(d[0])) {
             const out = d[0].map((p) => (Array.isArray(p) && typeof p[0] === "string" ? p[0] : "")).join("").slice(0, 600);
-            if (out) return send(200, { text: out, src: typeof d[2] === "string" ? d[2] : "" });
+            if (out) return send(200, { text: out, src: typeof d[2] === "string" ? d[2] : from === "auto" ? "" : from });
           }
         }
       } catch (e) { /* try the backup below */ }
       try {
-        const r2 = await fetch("https://api.mymemory.translated.net/get?q=" + encodeURIComponent(text) + "&langpair=" + encodeURIComponent("Autodetect|" + to));
+        const r2 = await fetch("https://api.mymemory.translated.net/get?q=" + encodeURIComponent(text) + "&langpair=" + encodeURIComponent((from === "auto" ? "Autodetect" : from) + "|" + to));
         if (r2.ok) {
           const d2 = await r2.json();
           const t = d2 && d2.responseData && d2.responseData.translatedText;
-          if (typeof t === "string" && t) return send(200, { text: t.slice(0, 600), src: "" });
+          if (typeof t === "string" && t) return send(200, { text: t.slice(0, 600), src: from === "auto" ? "" : from });
         }
       } catch (e) { /* give up */ }
       return send(502, { error: "Translate service unavailable" });
+    }
+
+    // feedback: a note from a user to the developer (bug, idea or other). Saved in dh_feedback, read it in the Supabase table editor.
+    if (b.action === "feedback") {
+      if (count(hitsFb, ip, 600000) > 3) return send(429, { error: "Too many feedback messages. Try again in a few minutes." });
+      const kind = b.kind === "bug" || b.kind === "idea" ? b.kind : "other";
+      const text = clean(b.text, 600);
+      if (text.length < 5) return send(400, { error: "Write a bit more (at least 5 characters)" });
+      const row = {
+        kind,
+        body: text,
+        ver: clean(b.ver, 80),
+        place: Number.isInteger(b.place) && b.place > 0 ? b.place : null,
+        exec: clean(b.exec, 40),
+        device: clean(b.device, 20),
+        name: clean(b.name, 40) || null,
+        uid: Number.isInteger(b.uid) && b.uid > 0 && clean(b.name, 40) ? b.uid : null,
+      };
+      const r = await fetch(furl, { method: "POST", headers: Object.assign({}, sb, { Prefer: "return=minimal" }), body: JSON.stringify(row) });
+      if (!r.ok) return send(502, { error: "Could not save" });
+      return send(200, { ok: true });
     }
 
     // stats: anonymous hub counter. The hub sends a random id (no Roblox id, no name). Returns how many hubs are alive.
