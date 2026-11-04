@@ -8,6 +8,8 @@ const crypto = require("crypto");
 
 const DECOY = "What are you doing here";
 const hits = {};
+let cache = { text: null, at: 0 };
+const TTL = 5 * 60 * 1000; // keep the file for 5 minutes so one GitHub call serves many people
 
 function send(status, body, extra) {
   return { statusCode: status, headers: Object.assign({ "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }, extra || {}), body };
@@ -41,15 +43,17 @@ exports.handler = async (event) => {
   const k = (event.queryStringParameters || {}).k;
   if (typeof k !== "string" || !same(k, secret)) return decoy();
 
+  if (cache.text && now - cache.at < TTL) return send(200, cache.text);
   try {
     const r = await fetch("https://api.github.com/repos/" + repo + "/contents/" + encodeURIComponent(file), {
       headers: { Authorization: "Bearer " + token, Accept: "application/vnd.github.raw", "User-Agent": "dh-gate", "X-GitHub-Api-Version": "2022-11-28" }
     });
-    if (!r.ok) return decoy();
+    if (!r.ok) return cache.text ? send(200, cache.text) : decoy(); // GitHub trouble: use the last good copy
     const text = await r.text();
-    if (text.length < 1000) return decoy();
+    if (text.length < 1000) return cache.text ? send(200, cache.text) : decoy();
+    cache = { text, at: now };
     return send(200, text);
   } catch (e) {
-    return decoy();
+    return cache.text ? send(200, cache.text) : decoy();
   }
 };
