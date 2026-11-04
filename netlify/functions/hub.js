@@ -2,7 +2,8 @@
 // Needs these environment variables on Netlify (never in this file or in GitHub):
 //   HUB_SECRET  the secret word that is inside the loader (?k=...)
 //   GH_TOKEN    fine-grained GitHub token, only for the private repo, Contents: Read-only
-// Optional: HUB_REPO (default Daffa2014/dh-core), HUB_FILE (default DaffzHub)
+//   HUB_REPO    owner/name of the private repo (as given on GitHub)
+//   HUB_FILE    name of the file inside that repo
 const crypto = require("crypto");
 
 const DECOY = "What are you doing here";
@@ -22,7 +23,9 @@ function same(a, b) {
 exports.handler = async (event) => {
   const secret = process.env.HUB_SECRET;
   const token = process.env.GH_TOKEN;
-  if (!secret || !token) return decoy();
+  const repo = process.env.HUB_REPO;
+  const file = process.env.HUB_FILE;
+  if (!secret || !token || !repo || !file) return decoy();
   if (event.httpMethod && event.httpMethod !== "GET") return decoy();
 
   const h = event.headers || {};
@@ -38,8 +41,6 @@ exports.handler = async (event) => {
   const k = (event.queryStringParameters || {}).k;
   if (typeof k !== "string" || !same(k, secret)) return decoy();
 
-  const repo = process.env.HUB_REPO || "Daffa2014/dh-core";
-  const file = process.env.HUB_FILE || "DaffzHub";
   try {
     const r = await fetch("https://api.github.com/repos/" + repo + "/contents/" + encodeURIComponent(file), {
       headers: { Authorization: "Bearer " + token, Accept: "application/vnd.github.raw", "User-Agent": "dh-gate", "X-GitHub-Api-Version": "2022-11-28" }
