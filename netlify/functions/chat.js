@@ -26,21 +26,23 @@ exports.handler = async (event) => {
   try { b = JSON.parse(event.body || "{}"); } catch (e) { return send(400, { error: { message: "Bad JSON" } }); }
   if (!b || !Array.isArray(b.contents)) return send(400, { error: { message: "Missing contents" } });
 
-  // keep only plain text, last 16 messages, limited length
-  let total = 0;
+  // keep only plain text, last 16 messages, each limited in length
   const contents = [];
   for (const m of b.contents.slice(-16)) {
     const role = m && m.role === "model" ? "model" : "user";
-    const text = m && m.parts && m.parts[0] && typeof m.parts[0].text === "string" ? m.parts[0].text.slice(0, 2000) : "";
+    const text = m && m.parts && m.parts[0] && typeof m.parts[0].text === "string" ? m.parts[0].text.slice(0, 4000) : "";
     if (!text) continue;
-    total += text.length;
     contents.push({ role, parts: [{ text }] });
   }
-  if (!contents.length || total > 8000) return send(400, { error: { message: "Message too long" } });
+  // too much history: drop the oldest messages until it fits, the newest one always stays
+  let total = contents.reduce((n, m) => n + m.parts[0].text.length, 0);
+  while (contents.length > 1 && total > 12000) total -= contents.shift().parts[0].text.length;
+  while (contents.length > 1 && contents[0].role !== "user") contents.shift();
+  if (!contents.length) return send(400, { error: { message: "Empty message" } });
 
   const sys = b.systemInstruction && b.systemInstruction.parts && b.systemInstruction.parts[0] && b.systemInstruction.parts[0].text;
   const model = MODELS.includes(b.model) ? b.model : MODELS[0];
-  const out = { contents, generationConfig: { temperature: 0.8, maxOutputTokens: 1024 } };
+  const out = { contents, generationConfig: { temperature: 0.8, maxOutputTokens: 2048 } };
   if (typeof sys === "string") out.systemInstruction = { parts: [{ text: sys.slice(0, 3000) }] };
 
   try {
@@ -53,4 +55,3 @@ exports.handler = async (event) => {
     return send(502, { error: { message: "Upstream error" } });
   }
 };
-  
