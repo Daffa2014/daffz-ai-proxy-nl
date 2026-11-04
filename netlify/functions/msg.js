@@ -1,4 +1,4 @@
-// DaffzHub Message proxy v8 (Netlify function). Supabase URL and service key live ONLY in
+// DaffzHub Message proxy v9 (Netlify function). Supabase URL and service key live ONLY in
 // Netlify environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY), never in this file or in GitHub.
 // Staff badges: OWNER_KEY (one secret) and ADMIN_KEYS (secrets separated by commas) are also Netlify environment variables.
 // Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private), c:<secret code> (group)
@@ -188,7 +188,9 @@ exports.handler = async (event) => {
       const room = b.room;
       const since = new Date(Date.now() - GROUP_ACTIVE_MS).toISOString();
       const activeOf = async (q) => {
-        const r = await fetch(gurl + "?select=room,uid&limit=20&last_seen=gte." + encodeURIComponent(since) + "&" + q, { headers: sb });
+        const qs = gurl + "?limit=20&last_seen=gte." + encodeURIComponent(since) + "&" + q;
+        let r = await fetch(qs + "&select=room,uid,gname", { headers: sb });
+        if (!r.ok) r = await fetch(qs + "&select=room,uid", { headers: sb }); // the gname column may not exist yet
         if (!r.ok) throw new Error("members");
         return r.json();
       };
@@ -210,18 +212,26 @@ exports.handler = async (event) => {
         const mine = await activeOf("uid=eq." + uid);
         if (mine.length >= GROUP_MAX_PER_USER) return send(409, { error: "You are already in " + GROUP_MAX_PER_USER + " groups" });
       }
-      const up = await fetch(gurl + "?on_conflict=room,uid", {
+      // the group name: the first person who gives one sets it for everybody, and nobody can change it later
+      const known = (list.find((m) => typeof m.gname === "string" && m.gname) || {}).gname || null;
+      const typed = clean(b.name, 20) || null;
+      const gname = known || typed;
+      const row = { room, uid, last_seen: new Date().toISOString() };
+      if (!known && typed) row.gname = typed;
+      const save = (r) => fetch(gurl + "?on_conflict=room,uid", {
         method: "POST",
         headers: Object.assign({}, sb, { Prefer: "resolution=merge-duplicates,return=minimal" }),
-        body: JSON.stringify({ room, uid, last_seen: new Date().toISOString() }),
+        body: JSON.stringify(r),
       });
+      let up = await save(row);
+      if (!up.ok && row.gname) { delete row.gname; up = await save(row); } // no gname column yet: still let the person in
       if (!up.ok) return send(502, { error: "Could not save" });
       if (Math.random() < 0.02) {
         const old = new Date(Date.now() - 45 * 86400000).toISOString();
         fetch(gurl + "?last_seen=lt." + encodeURIComponent(old), { method: "DELETE", headers: sb }).catch(() => {});
       }
       const t = makeToken(room, uid);
-      return send(200, { token: t.token, exp: t.exp, members: isMember ? list.length : list.length + 1, max: GROUP_MAX_MEMBERS });
+      return send(200, { token: t.token, exp: t.exp, members: isMember ? list.length : list.length + 1, max: GROUP_MAX_MEMBERS, gname: gname || null });
     }
 
     // translate: one short text -> target language (free public translate service, no key needed)
