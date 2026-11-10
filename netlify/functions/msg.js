@@ -1,4 +1,4 @@
-// DaffzHub Message proxy v9 (Netlify function). Supabase URL and service key live ONLY in
+// DaffzHub Message proxy v10 (Netlify function). v10 adds apush / apull (avatars shared between DaffzHub users of the same server). Supabase URL and service key live ONLY in
 // Netlify environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY), never in this file or in GitHub.
 // Staff badges: OWNER_KEY (one secret) and ADMIN_KEYS (secrets separated by commas) are also Netlify environment variables.
 // Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private), c:<secret code> (group)
@@ -11,6 +11,8 @@ const hitsTr = new Map();
 const hitsStats = new Map();
 const hitsGrp = new Map();
 const hitsFb = new Map();
+const hitsAvPush = new Map();
+const hitsAvPull = new Map();
 let statsCache = { t: 0, data: null };
 
 // who is this key? Only the server knows the secrets. Wrong or missing key = no badge.
@@ -63,6 +65,35 @@ const GROUP_MAX_MEMBERS = 5;
 const GROUP_MAX_PER_USER = 3;
 const GROUP_ACTIVE_MS = 30 * 86400000; // somebody who did not show up for 30 days frees the place
 const TOKEN_MS = 7 * 86400000;
+const AV_MAX_JSON = 20000;      // biggest avatar look (as text); the table also checks this
+const AV_ACTIVE_MS = 6 * 3600000; // a shared look older than this is ignored
+const SERVER_RE = /^s:[A-Za-z0-9_\-]{1,70}$/;
+
+// the look is plain data (numbers, short words, lists). Anything else is thrown away so nothing odd is stored.
+function cleanLook(v, depth) {
+  depth = depth || 0;
+  if (depth > 5) return undefined;
+  if (typeof v === "number") return Number.isFinite(v) ? v : undefined;
+  if (typeof v === "boolean") return v;
+  if (typeof v === "string") return /^[A-Za-z0-9_ .\-]{0,40}$/.test(v) ? v : undefined;
+  if (Array.isArray(v)) {
+    const out = [];
+    for (const x of v.slice(0, 80)) { const c = cleanLook(x, depth + 1); if (c !== undefined) out.push(c); }
+    return out;
+  }
+  if (v && typeof v === "object") {
+    const out = {};
+    let n = 0;
+    for (const k of Object.keys(v)) {
+      if (n++ >= 80) break;
+      if (!/^[A-Za-z0-9_]{1,30}$/.test(k)) continue;
+      const c = cleanLook(v[k], depth + 1);
+      if (c !== undefined) out[k] = c;
+    }
+    return out;
+  }
+  return undefined;
+}
 
 exports.handler = async (event) => {
   const send = (code, obj) => ({ statusCode: code, headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) });
@@ -84,6 +115,7 @@ exports.handler = async (event) => {
   const uurl = base.replace(/\/+$/, "") + "/rest/v1/dh_users";
   const gurl = base.replace(/\/+$/, "") + "/rest/v1/dh_group_members";
   const furl = base.replace(/\/+$/, "") + "/rest/v1/dh_feedback";
+  const aurl = base.replace(/\/+$/, "") + "/rest/v1/dh_avatars";
 
   // read the newest messages of one room (after = last id the client already has)
   async function readRoom(room, after) {
@@ -283,6 +315,71 @@ exports.handler = async (event) => {
       const r = await fetch(furl, { method: "POST", headers: Object.assign({}, sb, { Prefer: "return=minimal" }), body: JSON.stringify(row) });
       if (!r.ok) return send(502, { error: "Could not save" });
       return send(200, { ok: true });
+    }
+
+    // apush: share MY look with the other DaffzHub users of this server ({look: null} = stop sharing / back to normal)
+    if (b.action === "apush") {
+      if (count(hitsAvPush, ip, 60000) > 12) return send(429, { error: "Too many requests" });
+      if (typeof b.room !== "string" || !SERVER_RE.test(b.room)) return send(400, { error: "Bad room" });
+      const uid = Number.isInteger(b.uid) && b.uid > 0 ? b.uid : null;
+      const name = clean(b.name, 30);
+      if (!uid || !name) return send(400, { error: "Bad user" });
+      if (b.look === null) {
+        const d = await fetch(aurl + "?room=eq." + encodeURIComponent(b.room) + "&uid=eq." + uid, { method: "DELETE", headers: sb });
+        if (!d.ok) return send(502, { error: "Could not save" });
+        return send(200, { ok: true, cleared: true });
+      }
+      if (!b.look || typeof b.look !== "object" || Array.isArray(b.look)) return send(400, { error: "Bad look" });
+      const look = cleanLook(b.look);
+      const text = JSON.stringify(look);
+      if (!look || text.length < 2 || text.length > AV_MAX_JSON) return send(400, { error: "Look too big" });
+      const up = await fetch(aurl + "?on_conflict=room,uid", {
+        method: "POST",
+        headers: Object.assign({}, sb, { Prefer: "resolution=merge-duplicates,return=minimal" }),
+        body: JSON.stringify({ room: b.room, uid, name, look, updated_at: new Date().toISOString() }),
+      });
+      if (!up.ok) return send(502, { error: "Could not save" });
+      if (Math.random() < 0.05) {
+        const old = new Date(Date.now() - 86400000).toISOString();
+        fetch(aurl + "?updated_at=lt." + encodeURIComponent(old), { method: "DELETE", headers: sb }).catch(() => {});
+      }
+      return send(200, { ok: true });
+    }
+
+    // apull: the shared looks of the DaffzHub users who are in this server right now.
+    // Only somebody who is online in this server himself gets the list (same two-way rule as the user list).
+    // have = {"<uid>": "<updated_at>"} of what the hub already has, so unchanged looks are not sent again.
+    if (b.action === "apull") {
+      if (count(hitsAvPull, ip, 60000) > 30) return send(429, { error: "Too many requests" });
+      if (typeof b.room !== "string" || !SERVER_RE.test(b.room)) return send(400, { error: "Bad room" });
+      const uid = Number.isInteger(b.uid) && b.uid > 0 ? b.uid : null;
+      if (!uid) return send(400, { error: "Bad user" });
+      const since = new Date(Date.now() - 45000).toISOString();
+      const rp = await fetch(purl + "?select=uid,name,role&limit=100&room=eq." + encodeURIComponent(b.room) + "&seen_at=gte." + encodeURIComponent(since), { headers: sb });
+      if (!rp.ok) return send(502, { error: "Could not read" });
+      const here = await rp.json();
+      if (!here.some((u) => u && u.uid === uid)) return send(200, { list: [], uids: [], here: false });
+      const fresh = new Date(Date.now() - AV_ACTIVE_MS).toISOString();
+      const ra = await fetch(aurl + "?select=uid,name,look,updated_at&limit=60&order=updated_at.desc&room=eq." + encodeURIComponent(b.room) + "&updated_at=gte." + encodeURIComponent(fresh), { headers: sb });
+      if (!ra.ok) return send(502, { error: "Could not read" });
+      const rows = await ra.json();
+      const online = new Map();
+      for (const u of here) if (u && typeof u.uid === "number") online.set(u.uid, u);
+      const have = b.have && typeof b.have === "object" ? b.have : {};
+      const list = [];
+      const uids = [];
+      for (const r of rows) {
+        if (!r || typeof r.uid !== "number" || r.uid === uid || !online.has(r.uid)) continue;
+        uids.push(r.uid);
+        const u = online.get(r.uid);
+        const row = { uid: r.uid, name: r.name, role: u.role || null, t: r.updated_at };
+        if (have[String(r.uid)] !== r.updated_at) row.look = r.look;
+        list.push(row);
+      }
+      // people who are here (DaffzHub users) but share nothing are listed too, for the participants list
+      const people = [];
+      for (const u of here) if (u && typeof u.uid === "number" && u.uid !== uid) people.push({ uid: u.uid, name: u.name, role: u.role || null });
+      return send(200, { list, uids, people, here: true });
     }
 
     // stats: anonymous hub counter. The hub sends a random id (no Roblox id, no name). Returns how many hubs are alive.
