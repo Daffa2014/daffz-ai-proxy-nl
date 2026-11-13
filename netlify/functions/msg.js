@@ -1,4 +1,4 @@
-// DaffzHub Message proxy v10 (Netlify function). v10 adds apush / apull (avatars shared between DaffzHub users of the same server). Supabase URL and service key live ONLY in
+// DaffzHub Message proxy v11 (Netlify function). v11 adds the Staff Panel (admins, kick, block, warn, announcements, appeals, switches, log). v10 adds apush / apull (avatars shared between DaffzHub users of the same server). Supabase URL and service key live ONLY in
 // Netlify environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY), never in this file or in GitHub.
 // Staff badges: OWNER_KEY (one secret) and ADMIN_KEYS (secrets separated by commas) are also Netlify environment variables.
 // Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private), c:<secret code> (group)
@@ -95,6 +95,21 @@ function cleanLook(v, depth) {
   return undefined;
 }
 
+// ---- v11 staff panel helpers (outside the handler) ----
+const hitsStaff = new Map();
+const STAFF_FLAGS = ["msg_server", "msg_map", "msg_global", "msg_private", "msg_group", "online", "control"];
+const KICK_LIMIT = 3;              // admin: kicks per 24 hours
+const WARN_LIMIT = 3;              // warnings that trigger an automatic 1 day block
+const INVITE_MS = 10 * 60000;
+const ANNOUNCE_ADMIN_GAP = 60000;  // admin: one announcement per minute
+const cacheFlags = { t: 0, data: {} };
+const cacheBan = new Map();
+const cacheStaff = new Map();
+const ownerSeen = new Set();
+const sha256 = (s) => crypto.createHash("sha256").update("dh-staff|" + String(s)).digest("hex");
+const newKey = () => crypto.randomBytes(24).toString("base64url");
+const isUid = (v) => Number.isInteger(v) && v > 0;
+
 exports.handler = async (event) => {
   const send = (code, obj) => ({ statusCode: code, headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) });
   if (event.httpMethod !== "POST") return send(405, { error: "POST only" });
@@ -131,6 +146,118 @@ exports.handler = async (event) => {
   const afterOf = (v) => (Number.isInteger(v) && v >= 0 ? v : null);
 
   try {
+    // ================= v11: staff panel =================
+    const turl = (t) => base.replace(/\/+$/, "") + "/rest/v1/" + t;
+    const enc = encodeURIComponent;
+    const iso = (ms) => new Date(ms).toISOString();
+    const sbm = Object.assign({}, sb, { Prefer: "return=minimal" });
+    const sbr = Object.assign({}, sb, { Prefer: "return=representation" });
+    const sbu = Object.assign({}, sb, { Prefer: "resolution=merge-duplicates,return=minimal" });
+    const getRows = async (path) => {
+      const r = await fetch(turl(path), { headers: sb });
+      if (!r.ok) throw new Error("read " + path);
+      return r.json();
+    };
+
+    // owner key or a legacy admin key (env) first, then an admin made in the panel (key is stored only as a hash, bound to the user id)
+    async function roleOfReq(r) {
+      const k = r && r.key;
+      if (typeof k !== "string" || k.length < 8 || k.length > 100) return null;
+      const r0 = roleOf(k);
+      if (r0) return r0;
+      const uid = isUid(r.uid) ? r.uid : null;
+      if (!uid) return null;
+      const want = sha256(k);
+      const c = cacheStaff.get(uid);
+      let hash;
+      if (c && Date.now() - c.t < 30000) hash = c.hash;
+      else {
+        const rows = await getRows("dh_staff?select=key_hash&status=eq.active&uid=eq." + uid + "&limit=1");
+        hash = rows[0] && rows[0].key_hash ? rows[0].key_hash : null;
+        cacheStaff.set(uid, { t: Date.now(), hash });
+        if (cacheStaff.size > 2000) cacheStaff.clear();
+      }
+      if (!hash || hash.length !== want.length) return null;
+      return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(want)) ? "admin" : null;
+    }
+    async function flagsOff() {
+      if (Date.now() - cacheFlags.t < 10000) return cacheFlags.data;
+      const rows = await getRows("dh_flags?select=key&off=eq.true");
+      const set = {};
+      for (const x of rows) set[x.key] = true;
+      cacheFlags.t = Date.now();
+      cacheFlags.data = set;
+      return set;
+    }
+    async function activeBan(uid) {
+      if (!isUid(uid)) return null;
+      const c = cacheBan.get(uid);
+      if (c && Date.now() - c.t < 20000) return c.ban;
+      const rows = await getRows("dh_bans?select=id,reason,until,appeal_status,appeal_reply,created_at&uid=eq." + uid + "&active=eq.true&or=(until.is.null,until.gt." + enc(iso(Date.now())) + ")&order=id.desc&limit=1");
+      const ban = rows[0] || null;
+      cacheBan.set(uid, { t: Date.now(), ban });
+      if (cacheBan.size > 3000) cacheBan.clear();
+      return ban;
+    }
+    async function slog(role, uid, name, action, tuid, tname, detail) {
+      await fetch(turl("dh_stafflog"), { method: "POST", headers: sbm, body: JSON.stringify({
+        actor_uid: isUid(uid) ? uid : null, actor_name: clean(name, 40) || null, actor_role: role, action,
+        target_uid: isUid(tuid) ? tuid : null, target_name: clean(tname, 40) || null, detail: clean(detail, 300) || null }) }).catch(() => {});
+    }
+    async function targetStatus(tuid) {
+      const rows = await getRows("dh_staff?select=status&status=in.(owner,active)&uid=eq." + tuid + "&limit=1");
+      return rows[0] ? rows[0].status : null;
+    }
+    async function robloxFind(q) {
+      q = clean(q, 40).replace(/^@/, "");
+      if (!q) return null;
+      try {
+        if (/^\d{1,12}$/.test(q)) {
+          const r = await fetch("https://users.roblox.com/v1/users/" + q);
+          if (!r.ok) return null;
+          const d = await r.json();
+          return d && isUid(d.id) ? { uid: d.id, name: clean(d.displayName || d.name, 40), user: clean(d.name, 40) } : null;
+        }
+        const r = await fetch("https://users.roblox.com/v1/usernames/users", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ usernames: [q], excludeBannedUsers: false }) });
+        if (!r.ok) return null;
+        const d = await r.json();
+        const u = d && Array.isArray(d.data) ? d.data[0] : null;
+        return u && isUid(u.id) ? { uid: u.id, name: clean(u.displayName || u.name, 40), user: clean(u.name, 40) } : null;
+      } catch (e) { return null; }
+    }
+    // how many kicks has this admin used in the last 24 hours (and when does the oldest one free up)
+    async function kickQuota(uid) {
+      const rows = await getRows("dh_stafflog?select=at&action=eq.kick&actor_uid=eq." + uid + "&at=gte." + enc(iso(Date.now() - 86400000)) + "&order=at.asc&limit=20");
+      const left = Math.max(0, KICK_LIMIT - rows.length);
+      return { left, next: left === 0 && rows[0] ? Date.parse(rows[0].at) + 86400000 : null };
+    }
+    const roomKey = (room) => {
+      if (typeof room !== "string") return null;
+      if (room === "g") return "msg_global";
+      const p = room.slice(0, 2);
+      return p === "s:" ? "msg_server" : p === "m:" ? "msg_map" : p === "p:" ? "msg_private" : p === "c:" ? "msg_group" : null;
+    };
+
+    // every request passes here: blocked people and switched-off features are turned away before anything else happens
+    const gateAct = b.action;
+    if (gateAct !== "staff" && gateAct !== "stats" && gateAct !== "translate" && gateAct !== "feedback") {
+      const grole = typeof b.key === "string" ? await roleOfReq(b) : null;
+      if (grole !== "owner") {
+        if (isUid(b.uid) && (await activeBan(b.uid))) return send(403, { error: "You are blocked from DaffzHub", banned: true });
+        const off = await flagsOff();
+        if (gateAct === "send" && off[roomKey(b.room)]) return send(503, { error: "This chat mode is turned off by staff", off: roomKey(b.room) });
+        if (gateAct === "pull" && b.rooms && typeof b.rooms === "object") {
+          const gone = [];
+          for (const n of Object.keys(b.rooms)) {
+            if (off[roomKey(b.rooms[n])]) { gone.push(n); delete b.rooms[n]; }
+          }
+          if (gone.length && !Object.keys(b.rooms).length) return send(200, { rooms: {}, denied: [], off: gone });
+        }
+        if ((gateAct === "apush" || gateAct === "apull") && off.online) return send(503, { error: "Online is turned off by staff", off: "online" });
+        if ((gateAct === "gjoin" || gateAct === "gmembers" || gateAct === "gleave") && off.msg_group) return send(503, { error: "Groups are turned off by staff", off: "msg_group" });
+      }
+    }
     if (b.action === "send") {
       if (typeof b.room !== "string" || !ROOM_RE.test(b.room)) return send(400, { error: "Bad room" });
       const room = b.room;
@@ -143,7 +270,7 @@ exports.handler = async (event) => {
       if (!name || !body) return send(400, { error: "Empty message" });
       const uid = Number.isInteger(b.uid) && b.uid > 0 ? b.uid : null;
       if (GROUP_RE.test(room) && !checkToken(room, uid, b.token)) return send(403, { error: "Not a member of this group" });
-      const r = await fetch(url, { method: "POST", headers: Object.assign({ Prefer: "return=minimal" }, sb), body: JSON.stringify({ room, name, body, uid, role: roleOf(b.key) }) });
+      const r = await fetch(url, { method: "POST", headers: Object.assign({ Prefer: "return=minimal" }, sb), body: JSON.stringify({ room, name, body, uid, role: await roleOfReq(b) }) });
       if (!r.ok) return send(502, { error: "Could not save" });
       // now and then delete messages older than 1 day so the table stays small
       if (Math.random() < 0.05) {
@@ -184,7 +311,7 @@ exports.handler = async (event) => {
       const up = await fetch(purl + "?on_conflict=room,uid", {
         method: "POST",
         headers: Object.assign({}, sb, { Prefer: "resolution=merge-duplicates,return=minimal" }),
-        body: JSON.stringify({ room: b.room, uid, name, role: roleOf(b.key), seen_at: new Date().toISOString() }),
+        body: JSON.stringify({ room: b.room, uid, name, role: await roleOfReq(b), seen_at: new Date().toISOString() }),
       });
       if (!up.ok) return send(502, { error: "Could not save" });
       const since = new Date(Date.now() - 45000).toISOString();
@@ -407,6 +534,259 @@ exports.handler = async (event) => {
         fetch(uurl + "?last_seen=lt." + encodeURIComponent(old), { method: "DELETE", headers: sb }).catch(() => {});
       }
       return send(200, statsCache.data);
+    }
+
+
+    // staff: one action with an "op". Open to everybody: poll, accept, decline, appeal. The rest needs a staff key.
+    if (b.action === "staff") {
+      if (count(hitsStaff, ip, 60000) > 60) return send(429, { error: "Too many requests" });
+      const op = typeof b.op === "string" ? b.op : "";
+      const uid = isUid(b.uid) ? b.uid : null;
+      const myName = clean(b.name, 30);
+      const role = await roleOfReq(b);
+      const isOwner = role === "owner";
+      const target = isUid(b.target) ? b.target : null;
+      const tname = clean(b.tname, 40);
+      const futureOk = (v) => { const t = Date.parse(v); return Number.isFinite(t) && t > Date.now() + 30000 && t < Date.now() + 3650 * 86400000 ? t : null; };
+
+      if (op === "poll") {
+        if (!uid) return send(400, { error: "Bad user" });
+        if (isOwner && !ownerSeen.has(uid)) {
+          ownerSeen.add(uid);
+          await fetch(turl("dh_staff") + "?on_conflict=uid", { method: "POST", headers: sbu, body: JSON.stringify({ uid, name: myName || null, status: "owner", key_hash: null, expires_at: null }) }).catch(() => {});
+        }
+        const out = { role, flags: await flagsOff(), ban: isOwner ? null : await activeBan(uid), cmds: [], last: null };
+        const room = typeof b.room === "string" && SERVER_RE.test(b.room) ? b.room : null;
+        const map = typeof b.map === "string" && /^m:[A-Za-z0-9_\-]{1,70}$/.test(b.map) ? b.map : null;
+        const after = Number.isInteger(b.after) && b.after >= 0 ? b.after : null;
+        const parts = ["uid.eq." + uid, "scope.eq.all"];
+        if (room) parts.push("and(scope.eq.room,room.eq." + room + ")");
+        if (map) parts.push("and(scope.eq.room,room.eq." + map + ")");
+        let q = "dh_cmds?select=id,kind,payload,by_name&expires_at=gt." + enc(iso(Date.now())) + "&order=id.asc&limit=20&or=(" + parts.join(",") + ")";
+        q += after !== null ? "&id=gt." + after : "&created_at=gt." + enc(iso(Date.now() - 90000));
+        const cmds = await getRows(q);
+        out.cmds = cmds.map((c) => ({ id: c.id, kind: c.kind, payload: c.payload, by: c.by_name }));
+        if (cmds.length) out.last = cmds[cmds.length - 1].id;
+        const inv = await getRows("dh_staff?select=invited_by,expires_at&status=eq.invited&uid=eq." + uid + "&expires_at=gt." + enc(iso(Date.now())) + "&limit=1");
+        if (inv[0]) out.invite = { from: inv[0].invited_by, exp: inv[0].expires_at };
+        if (role === "admin") { const kq = await kickQuota(uid); out.kickLeft = kq.left; out.kickNext = kq.next; }
+        return send(200, out);
+      }
+
+      if (op === "accept" || op === "decline") {
+        if (!uid) return send(400, { error: "Bad user" });
+        const inv = await getRows("dh_staff?select=uid&status=eq.invited&uid=eq." + uid + "&expires_at=gt." + enc(iso(Date.now())) + "&limit=1");
+        if (!inv[0]) return send(410, { error: "The invitation is gone or expired" });
+        if (op === "decline") {
+          await fetch(turl("dh_staff") + "?status=eq.invited&uid=eq." + uid, { method: "DELETE", headers: sb });
+          return send(200, { ok: true });
+        }
+        const key = newKey();
+        const up = await fetch(turl("dh_staff") + "?status=eq.invited&uid=eq." + uid, { method: "PATCH", headers: sbm,
+          body: JSON.stringify({ status: "active", key_hash: sha256(key), accepted_at: iso(Date.now()), expires_at: null, name: myName || null }) });
+        if (!up.ok) return send(502, { error: "Could not save" });
+        cacheStaff.delete(uid);
+        await slog("admin", uid, myName, "accept", uid, myName, "accepted the admin invitation");
+        return send(200, { key });
+      }
+
+      if (op === "appeal") {
+        if (!uid) return send(400, { error: "Bad user" });
+        const text = clean(b.text, 300);
+        if (text.length < 5) return send(400, { error: "Write a bit more (at least 5 characters)" });
+        const rows = await getRows("dh_bans?select=id,appeal_status&uid=eq." + uid + "&active=eq.true&or=(until.is.null,until.gt." + enc(iso(Date.now())) + ")&order=id.desc&limit=1");
+        if (!rows[0]) return send(404, { error: "You are not blocked" });
+        if (rows[0].appeal_status !== "none") return send(409, { error: "You already sent an appeal for this block" });
+        const up = await fetch(turl("dh_bans") + "?id=eq." + rows[0].id, { method: "PATCH", headers: sbm, body: JSON.stringify({ appeal: text, appeal_at: iso(Date.now()), appeal_status: "pending" }) });
+        if (!up.ok) return send(502, { error: "Could not save" });
+        cacheBan.delete(uid);
+        await slog("user", uid, myName, "appeal", uid, myName, text);
+        return send(200, { ok: true });
+      }
+
+      // ---- everything below needs owner or admin ----
+      if (!role) return send(403, { error: "Not allowed" });
+      if (!uid) return send(400, { error: "Bad user" });
+      const actor = { role, uid, name: myName || "staff" };
+      const deny = (msg) => send(403, { error: msg });
+      // who may be touched: nobody touches the owner or himself; an admin cannot touch another admin
+      async function touchable(tuid) {
+        if (tuid === uid) return "You cannot do this to yourself";
+        const st = await targetStatus(tuid);
+        if (st === "owner") return "The owner cannot be touched";
+        if (st === "active" && !isOwner) return "Admins cannot do this to another admin";
+        return null;
+      }
+
+      if (op === "lookup") {
+        let f = target ? { uid: target, name: tname || String(target), user: "" } : await robloxFind(b.q);
+        if (!f) return send(404, { error: "User not found" });
+        const [ban, warns, st] = await Promise.all([
+          activeBan(f.uid),
+          getRows("dh_warns?select=id&cleared=eq.false&uid=eq." + f.uid),
+          targetStatus(f.uid),
+        ]);
+        return send(200, { uid: f.uid, name: f.name, user: f.user, ban, warns: warns.length, staff: st });
+      }
+
+      if (op === "ban") {
+        if (!target) return send(400, { error: "Bad target" });
+        const why = await touchable(target);
+        if (why) return deny(why);
+        let until = null;
+        if (b.until) { until = futureOk(b.until); if (!until) return send(400, { error: "The end time must be in the future" }); }
+        const reason = clean(b.reason, 120) || "No reason given";
+        await fetch(turl("dh_bans") + "?uid=eq." + target + "&active=eq.true", { method: "PATCH", headers: sbm, body: JSON.stringify({ active: false, ended_at: iso(Date.now()), ended_by: actor.name }) });
+        const ins = await fetch(turl("dh_bans"), { method: "POST", headers: sbm, body: JSON.stringify({ uid: target, name: tname || null, reason, by_uid: uid, by_name: actor.name, by_role: role, until: until ? iso(until) : null }) });
+        if (!ins.ok) return send(502, { error: "Could not save" });
+        cacheBan.delete(target);
+        await slog(role, uid, actor.name, "ban", target, tname, (until ? "until " + iso(until) : "permanent") + " | " + reason);
+        return send(200, { ok: true });
+      }
+      if (op === "unban") {
+        if (!target) return send(400, { error: "Bad target" });
+        await fetch(turl("dh_bans") + "?uid=eq." + target + "&active=eq.true", { method: "PATCH", headers: sbm, body: JSON.stringify({ active: false, ended_at: iso(Date.now()), ended_by: actor.name }) });
+        cacheBan.delete(target);
+        await slog(role, uid, actor.name, "unban", target, tname, "");
+        return send(200, { ok: true });
+      }
+      if (op === "bans") {
+        const rows = await getRows("dh_bans?select=id,uid,name,reason,until,by_name,by_role,created_at,appeal_status&active=eq.true&or=(until.is.null,until.gt." + enc(iso(Date.now())) + ")&order=id.desc&limit=50");
+        return send(200, { bans: rows });
+      }
+
+      if (op === "warn") {
+        if (!target) return send(400, { error: "Bad target" });
+        const why = await touchable(target);
+        if (why) return deny(why);
+        const reason = clean(b.reason, 120) || "No reason given";
+        const ins = await fetch(turl("dh_warns"), { method: "POST", headers: sbm, body: JSON.stringify({ uid: target, name: tname || null, reason, by_uid: uid, by_name: actor.name, by_role: role }) });
+        if (!ins.ok) return send(502, { error: "Could not save" });
+        const open = await getRows("dh_warns?select=id&cleared=eq.false&uid=eq." + target);
+        await fetch(turl("dh_cmds"), { method: "POST", headers: sbm, body: JSON.stringify({ kind: "warn", uid: target, scope: "user", payload: { reason, count: open.length, limit: WARN_LIMIT }, by_name: actor.name, expires_at: iso(Date.now() + 120000) }) });
+        await slog(role, uid, actor.name, "warn", target, tname, reason + " (" + open.length + "/" + WARN_LIMIT + ")");
+        let auto = false;
+        if (open.length >= WARN_LIMIT) {
+          auto = true;
+          await fetch(turl("dh_warns") + "?cleared=eq.false&uid=eq." + target, { method: "PATCH", headers: sbm, body: JSON.stringify({ cleared: true }) });
+          await fetch(turl("dh_bans") + "?uid=eq." + target + "&active=eq.true", { method: "PATCH", headers: sbm, body: JSON.stringify({ active: false, ended_at: iso(Date.now()), ended_by: "auto" }) });
+          await fetch(turl("dh_bans"), { method: "POST", headers: sbm, body: JSON.stringify({ uid: target, name: tname || null, reason: WARN_LIMIT + " warnings", by_name: "auto", by_role: "auto", until: iso(Date.now() + 86400000) }) });
+          cacheBan.delete(target);
+          await slog("auto", null, "auto", "ban", target, tname, "1 day, " + WARN_LIMIT + " warnings");
+        }
+        return send(200, { ok: true, count: auto ? WARN_LIMIT : open.length, limit: WARN_LIMIT, auto });
+      }
+      if (op === "warns") {
+        if (!target) return send(400, { error: "Bad target" });
+        const rows = await getRows("dh_warns?select=id,reason,by_name,created_at&cleared=eq.false&uid=eq." + target + "&order=id.desc&limit=20");
+        return send(200, { warns: rows });
+      }
+      if (op === "clearwarns") {
+        if (!isOwner) return deny("Only the owner can clear warnings");
+        if (!target) return send(400, { error: "Bad target" });
+        await fetch(turl("dh_warns") + "?cleared=eq.false&uid=eq." + target, { method: "PATCH", headers: sbm, body: JSON.stringify({ cleared: true }) });
+        await slog(role, uid, actor.name, "clearwarns", target, tname, "");
+        return send(200, { ok: true });
+      }
+
+      if (op === "kick") {
+        if (!target) return send(400, { error: "Bad target" });
+        const why = await touchable(target);
+        if (why) return deny(why);
+        let left = null;
+        if (!isOwner) {
+          const kq = await kickQuota(uid);
+          if (kq.left <= 0) return send(429, { error: "No kicks left", kickLeft: 0, kickNext: kq.next });
+          left = kq.left - 1;
+        }
+        const msg = clean(b.msg, 150);
+        const ins = await fetch(turl("dh_cmds"), { method: "POST", headers: sbm, body: JSON.stringify({ kind: "kick", uid: target, scope: "user", payload: { msg }, by_name: actor.name, expires_at: iso(Date.now() + 60000) }) });
+        if (!ins.ok) return send(502, { error: "Could not save" });
+        await slog(role, uid, actor.name, "kick", target, tname, msg);
+        return send(200, { ok: true, kickLeft: left });
+      }
+
+      if (op === "announce") {
+        const text = clean(b.text, 200);
+        if (text.length < 3) return send(400, { error: "Write a bit more (at least 3 characters)" });
+        const scope = b.scope === "all" || b.scope === "map" ? b.scope : "server";
+        if (scope === "all" && !isOwner) return deny("Only the owner can announce to everybody");
+        if (scope === "map" && !isOwner) return deny("Only the owner can announce to a whole map");
+        const room = scope === "map" ? b.room : scope === "server" ? b.room : null;
+        if (scope === "server" && !(typeof room === "string" && SERVER_RE.test(room))) return send(400, { error: "Bad server" });
+        if (scope === "map" && !(typeof room === "string" && /^m:[A-Za-z0-9_\-]{1,70}$/.test(room))) return send(400, { error: "Bad map" });
+        if (!isOwner) {
+          const last = await getRows("dh_stafflog?select=at&action=eq.announce&actor_uid=eq." + uid + "&at=gte." + enc(iso(Date.now() - ANNOUNCE_ADMIN_GAP)) + "&limit=1");
+          if (last[0]) return send(429, { error: "Wait a minute between announcements" });
+        }
+        const ins = await fetch(turl("dh_cmds"), { method: "POST", headers: sbm, body: JSON.stringify({ kind: "announce", uid: null, scope: scope === "all" ? "all" : "room", room: scope === "all" ? null : room, payload: { text }, by_name: actor.name, expires_at: iso(Date.now() + 600000) }) });
+        if (!ins.ok) return send(502, { error: "Could not save" });
+        await slog(role, uid, actor.name, "announce", null, scope, text);
+        return send(200, { ok: true });
+      }
+
+      // ---- owner only ----
+      if (!isOwner) return deny("Only the owner can do this");
+
+      if (op === "flag") {
+        const k = typeof b.flag === "string" ? b.flag : "";
+        if (STAFF_FLAGS.indexOf(k) < 0) return send(400, { error: "Bad switch" });
+        const off = b.off === true;
+        const up = await fetch(turl("dh_flags") + "?on_conflict=key", { method: "POST", headers: sbu, body: JSON.stringify({ key: k, off, by_name: actor.name, updated_at: iso(Date.now()) }) });
+        if (!up.ok) return send(502, { error: "Could not save" });
+        cacheFlags.t = 0;
+        await slog(role, uid, actor.name, "flag", null, k, off ? "OFF" : "ON");
+        return send(200, { ok: true, flags: await flagsOff() });
+      }
+      if (op === "invite") {
+        const f = target ? { uid: target, name: tname || String(target) } : await robloxFind(b.q);
+        if (!f) return send(404, { error: "User not found" });
+        if (f.uid === uid) return send(400, { error: "That is you" });
+        const st = await targetStatus(f.uid);
+        if (st === "owner") return send(400, { error: "That is the owner" });
+        if (st === "active") return send(409, { error: f.name + " is already an admin" });
+        const up = await fetch(turl("dh_staff") + "?on_conflict=uid", { method: "POST", headers: sbu, body: JSON.stringify({ uid: f.uid, name: f.name, status: "invited", key_hash: null, invited_by: actor.name, invited_at: iso(Date.now()), expires_at: iso(Date.now() + INVITE_MS), accepted_at: null }) });
+        if (!up.ok) return send(502, { error: "Could not save" });
+        await slog(role, uid, actor.name, "invite", f.uid, f.name, "admin invitation (10 min)");
+        return send(200, { ok: true, uid: f.uid, name: f.name, exp: iso(Date.now() + INVITE_MS) });
+      }
+      if (op === "uninvite" || op === "unadmin") {
+        if (!target) return send(400, { error: "Bad target" });
+        const st = op === "unadmin" ? "active" : "invited";
+        await fetch(turl("dh_staff") + "?status=eq." + st + "&uid=eq." + target, { method: "DELETE", headers: sb });
+        cacheStaff.delete(target);
+        await slog(role, uid, actor.name, op, target, tname, "");
+        return send(200, { ok: true });
+      }
+      if (op === "admins") {
+        const rows = await getRows("dh_staff?select=uid,name,status,expires_at,accepted_at&status=in.(invited,active)&order=invited_at.desc&limit=60");
+        return send(200, { admins: rows });
+      }
+      if (op === "appeals") {
+        const rows = await getRows("dh_bans?select=id,uid,name,reason,appeal,appeal_at&appeal_status=eq.pending&active=eq.true&order=appeal_at.asc&limit=30");
+        return send(200, { appeals: rows });
+      }
+      if (op === "review") {
+        const id = Number.isInteger(b.id) && b.id > 0 ? b.id : null;
+        if (!id) return send(400, { error: "Bad appeal" });
+        const rows = await getRows("dh_bans?select=id,uid,name&appeal_status=eq.pending&id=eq." + id + "&limit=1");
+        if (!rows[0]) return send(404, { error: "Appeal not found" });
+        const accept = b.accept === true;
+        const reply = clean(b.reply, 150);
+        const patch = { appeal_status: accept ? "accepted" : "rejected", appeal_reply: reply || null };
+        if (accept) { patch.active = false; patch.ended_at = iso(Date.now()); patch.ended_by = actor.name; }
+        const up = await fetch(turl("dh_bans") + "?id=eq." + id, { method: "PATCH", headers: sbm, body: JSON.stringify(patch) });
+        if (!up.ok) return send(502, { error: "Could not save" });
+        cacheBan.delete(rows[0].uid);
+        await slog(role, uid, actor.name, accept ? "appeal_accept" : "appeal_reject", rows[0].uid, rows[0].name, reply);
+        return send(200, { ok: true });
+      }
+      if (op === "log") {
+        let q = "dh_stafflog?select=at,actor_name,actor_role,action,target_name,detail&order=id.desc&limit=100";
+        if (target) q += "&or=(actor_uid.eq." + target + ",target_uid.eq." + target + ")";
+        return send(200, { log: await getRows(q) });
+      }
+      return send(400, { error: "Bad op" });
     }
 
     return send(400, { error: "Bad action" });
