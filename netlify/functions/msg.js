@@ -657,8 +657,10 @@ exports.handler = async (event) => {
           getRows("dh_warns?select=id&cleared=eq.false&uid=eq." + f.uid),
           targetStatus(f.uid),
         ]);
-        const hu = (await getRows("dh_users?select=last_seen&id=eq." + f.uid + "&limit=1"))[0];
-        const hub = hu ? { last: hu.last_seen, ago: Math.max(0, Math.floor((Date.now() - Date.parse(hu.last_seen)) / 1000)), online: Date.parse(hu.last_seen) > Date.now() - 120000 } : false;
+        const hp = (await getRows("dh_presence?select=seen_at&uid=eq." + f.uid + "&order=seen_at.desc&limit=1"))[0];
+        const hm = hp ? null : (await getRows("dh_messages?select=created_at&uid=eq." + f.uid + "&order=id.desc&limit=1"))[0];
+        const hl = hp ? hp.seen_at : hm ? hm.created_at : null;
+        const hub = hl ? { last: hl, ago: Math.max(0, Math.floor((Date.now() - Date.parse(hl)) / 1000)), online: !!hp && Date.parse(hp.seen_at) > Date.now() - 180000 } : false;
         return send(200, { uid: f.uid, name: f.name, user: f.user, ban, warns: warns.length, staff: st, tampered: await isTampered(f.uid, true), hub });
       }
 
