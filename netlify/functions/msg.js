@@ -1,4 +1,4 @@
-// DaffzHub Message proxy v12 (Netlify function). v12 adds tamper detection (a copy that stays in the game after a kick is flagged and loses the online features until the owner clears it). v11 adds the Staff Panel (admins, kick, block, warn, announcements, appeals, switches, log). v10 adds apush / apull (avatars shared between DaffzHub users of the same server). Supabase URL and service key live ONLY in
+// DaffzHub Message proxy v13 (Netlify function). v13: lookup also says whether the player is a DaffzHub user. v12 adds tamper detection (a copy that stays in the game after a kick is flagged and loses the online features until the owner clears it). v11 adds the Staff Panel (admins, kick, block, warn, announcements, appeals, switches, log). v10 adds apush / apull (avatars shared between DaffzHub users of the same server). Supabase URL and service key live ONLY in
 // Netlify environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY), never in this file or in GitHub.
 // Staff badges: OWNER_KEY (one secret) and ADMIN_KEYS (secrets separated by commas) are also Netlify environment variables.
 // Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private), c:<secret code> (group)
@@ -657,7 +657,9 @@ exports.handler = async (event) => {
           getRows("dh_warns?select=id&cleared=eq.false&uid=eq." + f.uid),
           targetStatus(f.uid),
         ]);
-        return send(200, { uid: f.uid, name: f.name, user: f.user, ban, warns: warns.length, staff: st, tampered: await isTampered(f.uid, true) });
+        const hu = (await getRows("dh_users?select=last_seen&id=eq." + f.uid + "&limit=1"))[0];
+        const hub = hu ? { last: hu.last_seen, ago: Math.max(0, Math.floor((Date.now() - Date.parse(hu.last_seen)) / 1000)), online: Date.parse(hu.last_seen) > Date.now() - 120000 } : false;
+        return send(200, { uid: f.uid, name: f.name, user: f.user, ban, warns: warns.length, staff: st, tampered: await isTampered(f.uid, true), hub });
       }
 
       if (op === "ban") {
