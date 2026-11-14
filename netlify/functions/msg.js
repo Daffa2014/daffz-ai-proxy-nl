@@ -1,4 +1,4 @@
-// DaffzHub Message proxy v11 (Netlify function). v11 adds the Staff Panel (admins, kick, block, warn, announcements, appeals, switches, log). v10 adds apush / apull (avatars shared between DaffzHub users of the same server). Supabase URL and service key live ONLY in
+// DaffzHub Message proxy v12 (Netlify function). v12 adds tamper detection (a copy that stays in the game after a kick is flagged and loses the online features until the owner clears it). v11 adds the Staff Panel (admins, kick, block, warn, announcements, appeals, switches, log). v10 adds apush / apull (avatars shared between DaffzHub users of the same server). Supabase URL and service key live ONLY in
 // Netlify environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY), never in this file or in GitHub.
 // Staff badges: OWNER_KEY (one secret) and ADMIN_KEYS (secrets separated by commas) are also Netlify environment variables.
 // Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private), c:<secret code> (group)
@@ -199,6 +199,18 @@ exports.handler = async (event) => {
       if (cacheBan.size > 3000) cacheBan.clear();
       return ban;
     }
+    // a flagged copy (it stayed in the game after a kick) loses the online features for 3 days, or until the owner clears it
+    const cacheTamper = new Map();
+    async function isTampered(uid, fresh) {
+      if (!isUid(uid)) return false;
+      const c = cacheTamper.get(uid);
+      if (!fresh && c && Date.now() - c.t < 30000) return c.v;
+      const rows = await getRows("dh_kickwatch?select=uid&uid=eq." + uid + "&flagged=eq.true&flagged_at=gt." + enc(iso(Date.now() - 3 * 86400000)) + "&limit=1");
+      const v = rows.length > 0;
+      cacheTamper.set(uid, { t: Date.now(), v });
+      if (cacheTamper.size > 3000) cacheTamper.clear();
+      return v;
+    }
     async function slog(role, uid, name, action, tuid, tname, detail) {
       await fetch(turl("dh_stafflog"), { method: "POST", headers: sbm, body: JSON.stringify({
         actor_uid: isUid(uid) ? uid : null, actor_name: clean(name, 40) || null, actor_role: role, action,
@@ -245,6 +257,7 @@ exports.handler = async (event) => {
       const grole = typeof b.key === "string" ? await roleOfReq(b) : null;
       if (grole !== "owner") {
         if (isUid(b.uid) && (await activeBan(b.uid))) return send(403, { error: "You are blocked from DaffzHub", banned: true });
+        if (isUid(b.uid) && (await isTampered(b.uid))) return send(403, { error: "This DaffzHub copy was modified, so the online features are off for you. Ask the owner to clear it.", tampered: true });
         const off = await flagsOff();
         if (gateAct === "send" && off[roomKey(b.room)]) return send(503, { error: "This chat mode is turned off by staff", off: roomKey(b.room) });
         if (gateAct === "pull" && b.rooms && typeof b.rooms === "object") {
@@ -557,6 +570,20 @@ exports.handler = async (event) => {
         }
         const out = { role, flags: await flagsOff(), ban: isOwner ? null : await activeBan(uid), cmds: [], last: null };
         const room = typeof b.room === "string" && SERVER_RE.test(b.room) ? b.room : null;
+        // tamper check: a copy that got a kick, kept its place in the same server and still asks for commands a minute later did not run the kick
+        if (!isOwner && Number.isInteger(b.after) && b.after >= 0) {
+          const w = (await getRows("dh_kickwatch?select=cmd_id,delivered_at,flagged,room&uid=eq." + uid + "&limit=1"))[0];
+          if (w && !w.flagged) {
+            const age = Date.now() - Date.parse(w.delivered_at);
+            if (age > 600000) {
+              await fetch(turl("dh_kickwatch") + "?uid=eq." + uid, { method: "DELETE", headers: sb }).catch(() => {});
+            } else if (age > 60000 && room && w.room === room && b.after >= w.cmd_id) {
+              await fetch(turl("dh_kickwatch") + "?uid=eq." + uid, { method: "PATCH", headers: sbm, body: JSON.stringify({ flagged: true, flagged_at: iso(Date.now()) }) });
+              cacheTamper.delete(uid);
+              await slog("auto", 0, "server", "tamper", uid, myName, "stayed in the server after a kick (kick code removed?)");
+            }
+          }
+        }
         const map = typeof b.map === "string" && /^m:[A-Za-z0-9_\-]{1,70}$/.test(b.map) ? b.map : null;
         const after = Number.isInteger(b.after) && b.after >= 0 ? b.after : null;
         const parts = ["uid.eq." + uid, "scope.eq.all"];
@@ -567,6 +594,10 @@ exports.handler = async (event) => {
         const cmds = await getRows(q);
         out.cmds = cmds.map((c) => ({ id: c.id, kind: c.kind, payload: c.payload, by: c.by_name }));
         if (cmds.length) out.last = cmds[cmds.length - 1].id;
+        const kicks = cmds.filter((c) => c.kind === "kick");
+        if (kicks.length && !isOwner) {
+          await fetch(turl("dh_kickwatch") + "?on_conflict=uid", { method: "POST", headers: sbu, body: JSON.stringify({ uid, cmd_id: kicks[kicks.length - 1].id, delivered_at: iso(Date.now()), flagged: false, flagged_at: null, room }) }).catch(() => {});
+        }
         const inv = await getRows("dh_staff?select=invited_by,expires_at&status=eq.invited&uid=eq." + uid + "&expires_at=gt." + enc(iso(Date.now())) + "&limit=1");
         if (inv[0]) out.invite = { from: inv[0].invited_by, exp: inv[0].expires_at };
         if (role === "admin") { const kq = await kickQuota(uid); out.kickLeft = kq.left; out.kickNext = kq.next; }
@@ -626,7 +657,7 @@ exports.handler = async (event) => {
           getRows("dh_warns?select=id&cleared=eq.false&uid=eq." + f.uid),
           targetStatus(f.uid),
         ]);
-        return send(200, { uid: f.uid, name: f.name, user: f.user, ban, warns: warns.length, staff: st });
+        return send(200, { uid: f.uid, name: f.name, user: f.user, ban, warns: warns.length, staff: st, tampered: await isTampered(f.uid, true) });
       }
 
       if (op === "ban") {
@@ -686,6 +717,15 @@ exports.handler = async (event) => {
         if (!target) return send(400, { error: "Bad target" });
         await fetch(turl("dh_warns") + "?cleared=eq.false&uid=eq." + target, { method: "PATCH", headers: sbm, body: JSON.stringify({ cleared: true }) });
         await slog(role, uid, actor.name, "clearwarns", target, tname, "");
+        return send(200, { ok: true });
+      }
+
+      if (op === "untamper") {
+        if (!isOwner) return deny("Only the owner can clear a modified-copy flag");
+        if (!target) return send(400, { error: "Bad target" });
+        await fetch(turl("dh_kickwatch") + "?uid=eq." + target, { method: "DELETE", headers: sb });
+        cacheTamper.delete(target);
+        await slog(role, uid, actor.name, "untamper", target, tname, "");
         return send(200, { ok: true });
       }
 
