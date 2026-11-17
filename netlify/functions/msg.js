@@ -1,4 +1,4 @@
-// DaffzHub Message proxy v13 (Netlify function). v13: lookup also says whether the player is a DaffzHub user. v12 adds tamper detection (a copy that stays in the game after a kick is flagged and loses the online features until the owner clears it). v11 adds the Staff Panel (admins, kick, block, warn, announcements, appeals, switches, log). v10 adds apush / apull (avatars shared between DaffzHub users of the same server). Supabase URL and service key live ONLY in
+// DaffzHub Message proxy v14 (Netlify function). v14: owner can switch the whole DaffzHub off (with a reason) and the hub shows a notice. v13: lookup also says whether the player is a DaffzHub user. v12 adds tamper detection (a copy that stays in the game after a kick is flagged and loses the online features until the owner clears it). v11 adds the Staff Panel (admins, kick, block, warn, announcements, appeals, switches, log). v10 adds apush / apull (avatars shared between DaffzHub users of the same server). Supabase URL and service key live ONLY in
 // Netlify environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY), never in this file or in GitHub.
 // Staff badges: OWNER_KEY (one secret) and ADMIN_KEYS (secrets separated by commas) are also Netlify environment variables.
 // Rooms: s:<JobId> (server), m:<PlaceId> (map), g (global), p:<id>_<id> (private), c:<secret code> (group)
@@ -97,12 +97,13 @@ function cleanLook(v, depth) {
 
 // ---- v11 staff panel helpers (outside the handler) ----
 const hitsStaff = new Map();
-const STAFF_FLAGS = ["msg_server", "msg_map", "msg_global", "msg_private", "msg_group", "online", "control"];
+const STAFF_FLAGS = ["msg_server", "msg_map", "msg_global", "msg_private", "msg_group", "online", "control", "hub"];
 const KICK_LIMIT = 3;              // admin: kicks per 24 hours
 const WARN_LIMIT = 3;              // warnings that trigger an automatic 1 day block
 const INVITE_MS = 10 * 60000;
 const ANNOUNCE_ADMIN_GAP = 60000;  // admin: one announcement per minute
 const cacheFlags = { t: 0, data: {} };
+const hubReason = { t: 0, v: "" };
 const cacheBan = new Map();
 const cacheStaff = new Map();
 const ownerSeen = new Set();
@@ -259,6 +260,7 @@ exports.handler = async (event) => {
         if (isUid(b.uid) && (await activeBan(b.uid))) return send(403, { error: "You are blocked from DaffzHub", banned: true });
         if (isUid(b.uid) && (await isTampered(b.uid))) return send(403, { error: "This DaffzHub copy was modified, so the online features are off for you. Ask the owner to clear it.", tampered: true });
         const off = await flagsOff();
+        if (off.hub) return send(503, { error: "DaffzHub is turned off by the owner", hubOff: true });
         if (gateAct === "send" && off[roomKey(b.room)]) return send(503, { error: "This chat mode is turned off by staff", off: roomKey(b.room) });
         if (gateAct === "pull" && b.rooms && typeof b.rooms === "object") {
           const gone = [];
@@ -569,6 +571,13 @@ exports.handler = async (event) => {
           await fetch(turl("dh_staff") + "?on_conflict=uid", { method: "POST", headers: sbu, body: JSON.stringify({ uid, name: myName || null, status: "owner", key_hash: null, expires_at: null }) }).catch(() => {});
         }
         const out = { role, flags: await flagsOff(), ban: isOwner ? null : await activeBan(uid), cmds: [], last: null };
+        if (!isOwner && out.flags.hub) {
+          if (Date.now() - hubReason.t > 10000) {
+            const hr = (await getRows("dh_flags?select=reason&key=eq.hub&limit=1"))[0];
+            hubReason.v = hr && hr.reason ? hr.reason : ""; hubReason.t = Date.now();
+          }
+          out.hubOff = { reason: hubReason.v };
+        }
         const room = typeof b.room === "string" && SERVER_RE.test(b.room) ? b.room : null;
         // tamper check: a copy that got a kick, kept its place in the same server and still asks for commands a minute later did not run the kick
         if (!isOwner && Number.isInteger(b.after) && b.after >= 0) {
@@ -776,10 +785,12 @@ exports.handler = async (event) => {
         const k = typeof b.flag === "string" ? b.flag : "";
         if (STAFF_FLAGS.indexOf(k) < 0) return send(400, { error: "Bad switch" });
         const off = b.off === true;
-        const up = await fetch(turl("dh_flags") + "?on_conflict=key", { method: "POST", headers: sbu, body: JSON.stringify({ key: k, off, by_name: actor.name, updated_at: iso(Date.now()) }) });
+        const fr = k === "hub" && off ? (clean(b.reason, 150) || null) : null;
+        const up = await fetch(turl("dh_flags") + "?on_conflict=key", { method: "POST", headers: sbu, body: JSON.stringify({ key: k, off, by_name: actor.name, updated_at: iso(Date.now()), reason: fr }) });
         if (!up.ok) return send(502, { error: "Could not save" });
         cacheFlags.t = 0;
-        await slog(role, uid, actor.name, "flag", null, k, off ? "OFF" : "ON");
+        hubReason.t = 0;
+        await slog(role, uid, actor.name, "flag", null, k, (off ? "OFF" : "ON") + (fr ? " | " + fr : ""));
         return send(200, { ok: true, flags: await flagsOff() });
       }
       if (op === "invite") {
